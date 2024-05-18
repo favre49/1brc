@@ -8,8 +8,107 @@
 #define NUM_THREADS 8
 #endif
 
+// Open addressed hash map that uses a fixed array size and linear probing.
+// Assumes that the number of entries is less than SIZE.
+// Does not support deletion.
+template<typename K, typename V, const int SIZE = 1<<16>
+struct FixedHashMap {
+  // Hash map entry. This appears to be faster than std::optional
+  // and emplace().
+  struct Entry {
+    bool exists;
+    std::pair<K, V> value;
+  };
+
+  // Forward iterator for FixedHashMap.
+  struct iterator {
+    using value_type = std::pair<K, V>;
+    using difference_type = ptrdiff_t;
+    using pointer = value_type*;
+    using reference = value_type&;
+    using iterator_category = std::forward_iterator_tag;
+
+    std::array<Entry, SIZE> &data;
+    size_t idx;
+
+    iterator(std::array<Entry, SIZE>& __data, size_t __idx = 0)
+      : data(__data), idx(__idx) {
+        while(idx < SIZE && !data[idx].exists) idx++;
+      }
+
+    reference operator*() const {
+      return data[idx].value;
+    }
+
+    pointer operator->() const {
+      return &(data[idx].value);
+    }
+
+    iterator& operator++() {
+      do {
+        idx++;
+      } while(idx < SIZE && !data[idx].exists);
+      return *this;
+    }
+
+    iterator operator++(int) {
+      iterator temp = *this;
+      ++(*this);
+      return temp;
+    }
+
+    bool operator==(const iterator& other) const {
+      return std::addressof(data) == std::addressof(other.data) && idx == other.idx;
+    }
+
+    bool operator!=(const iterator& other) const {
+      return !(*this == other);
+    }
+  };
+
+  std::array<Entry, SIZE> hash_array;
+
+  FixedHashMap() {
+    // SIZE must be a power of 2 so that we can use masking.
+    static_assert((SIZE&(SIZE-1)) == 0);
+  }
+
+  size_t inline __attribute__((always_inline)) array_index(const size_t x) {
+    return x&(SIZE-1);
+  }
+
+  iterator begin() {
+    return iterator(hash_array);
+  }
+
+  iterator end() {
+    return iterator(hash_array, SIZE);
+  }
+
+  template<typename T>
+  V& operator[](T&& key) {
+    auto key_hash = std::hash<K>{}(key);
+    for (;; key_hash++) {
+      size_t idx = array_index(key_hash);
+      if (!hash_array[idx].exists) {
+        // key does not exist in the hash map, so create it.
+        hash_array[idx].exists = 1;
+        hash_array[idx].value.first = key;
+        return hash_array[idx].value.second;
+      }
+      if (hash_array[idx].value.first == key) {
+        // key already exists in the hash map - just return the reference
+        return hash_array[idx].value.second;
+      }
+    }
+    // UB. This should never happen, since we assume the number of elements is
+    // less than SIZE.
+    assert(false);
+  }
+};
+
 struct Data {
-  std::string name = "";
+  std::string_view name;
   int count = 0;
   int64_t sum = 0;
   int min = std::numeric_limits<int>::max();
@@ -35,43 +134,42 @@ struct Data {
 };
 
 struct ThreadData {
-  __gnu_pbds::gp_hash_table<std::string, Data> temp_map;
+  FixedHashMap<std::string_view, Data> temp_map;
 
   ThreadData() = default;
 };
 
-void process_chunk(const char* data, int start, int end, ThreadData& state) {
-  // Go back until start points to a '\n'
-  while(start >= 0 && data[start] != '\n') start--;
-  start++;
+void process_chunk(const char* data, size_t start, size_t end, ThreadData& state) {
+  // Go back until start points to a '\n', or you reach the beginning.
+  while(start > 0 && data[start] != '\n') start--;
+  if (start != 0) start++;
 
-  // Go back until end points to a '\n'
+  // Go back until end points to a '\n'.
   while(end >= 0 && data[end] != '\n') end--;
 
-  // Now [start, end] is the set of lines we want
-  std::string name;
-  name.reserve(100);
+  // Now [start, end] is the set of lines we want.
   int temp = 0, coeff = 1;
+  size_t last = start, sz = 0;
   bool name_mode = true;
-  for (int i = start; i <= end; i++) {
+  for (size_t i = start; i <= end; i++) {
     const char& c = data[i];
     if (c == '\n') {
-      state.temp_map[name] += coeff*temp;
+      state.temp_map[std::string_view(data + last, sz)] += coeff*temp;
 
       // reset
       name_mode = true;
       temp =0;
       coeff = 1;
-      name.clear();
+      last = i+1;
+      sz = 0;
     } else if (c == ';') {
       name_mode = false;
-    } else if (c == '.') continue;
-    else if (name_mode) {
-      name.push_back(c);
+    } else if (name_mode) {
+      sz++;
     } else {
       if (c == '-') {
         coeff = -1;
-      } else {
+      } else if (c != '.') {
         temp = 10*temp + (c - '0');
       }
     }
@@ -95,7 +193,7 @@ int main(int argc, char* argv[]) {
     std::cerr << "Failed to fstat file" << std::endl;
     return 1;
   }
-  int file_size = (int)file_stat.st_size;
+  size_t file_size = (size_t)file_stat.st_size;
 
   const char* mapped_data = static_cast<char*>(mmap(nullptr, file_size, PROT_READ, MAP_PRIVATE, fd, 0));
   if (mapped_data == MAP_FAILED) {
@@ -106,9 +204,9 @@ int main(int argc, char* argv[]) {
   std::vector<std::thread> threads;
   threads.reserve(NUM_THREADS);
   std::vector<ThreadData> states(NUM_THREADS);
-  int chunk_size = (file_size + NUM_THREADS - 1)/NUM_THREADS, last = 0;
+  size_t chunk_size = (file_size + NUM_THREADS - 1)/NUM_THREADS, last = 0;
   for (int i = 0; i < NUM_THREADS; i++) {
-    int end = std::min(last + chunk_size, file_size);
+    size_t end = std::min(last + chunk_size, file_size);
     threads.emplace_back(process_chunk, mapped_data, last, end, std::ref(states[i]));
     last = end;
   }
