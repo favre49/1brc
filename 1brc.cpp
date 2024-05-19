@@ -8,6 +8,7 @@
 #define NUM_THREADS 8
 #endif
 
+
 // Open addressed hash map that uses a fixed array size and linear probing.
 // Assumes that the number of entries is less than SIZE.
 // Does not support deletion.
@@ -195,6 +196,8 @@ int main(int argc, char* argv[]) {
   }
   size_t file_size = (size_t)file_stat.st_size;
 
+  // Using MAP_POPULATE reduces execution time to a third when running cold,
+  // but is worse when running warm.
   const char* mapped_data = static_cast<char*>(mmap(nullptr, file_size, PROT_READ, MAP_PRIVATE, fd, 0));
   if (mapped_data == MAP_FAILED) {
     std::cerr << "Failed to mmap file" << std::endl;
