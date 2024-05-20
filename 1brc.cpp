@@ -8,6 +8,18 @@
 #define NUM_THREADS 8
 #endif
 
+struct hash_t {
+  const static uint32_t BASE = 1e9+123;
+  uint32_t val;
+
+  hash_t(): val(0) {}
+
+  hash_t& operator+=(char c) {
+    val = BASE*val + c;
+    return *this;
+  }
+};
+
 
 // Open addressed hash map that uses a fixed array size and linear probing.
 // Assumes that the number of entries is less than SIZE.
@@ -88,8 +100,15 @@ struct FixedHashMap {
 
   template<typename T>
   V& operator[](T&& key) {
-    auto key_hash = std::hash<K>{}(key);
-    for (;; key_hash++) {
+    hash_t h;
+    for (auto& c : key) h += c;
+    return at_with_hash(std::forward<T>(key), h);
+  }
+
+  template<typename T>
+  V& at_with_hash(T&& key, hash_t h) {
+    auto key_hash = h.val;
+    for (;;key_hash++) {
       size_t idx = array_index(key_hash);
       if (!hash_array[idx].exists) {
         // key does not exist in the hash map, so create it.
@@ -151,11 +170,12 @@ void process_chunk(const char* data, size_t start, size_t end, ThreadData& state
   // Now [start, end] is the set of lines we want.
   int temp = 0, coeff = 1;
   size_t last = start, sz = 0;
+  hash_t h;
   bool name_mode = true;
   for (size_t i = start; i <= end; i++) {
     const char& c = data[i];
     if (c == '\n') {
-      state.temp_map[std::string_view(data + last, sz)] += coeff*temp;
+      state.temp_map.at_with_hash(std::string_view(data + last, sz), h) += coeff*temp;
 
       // reset
       name_mode = true;
@@ -163,9 +183,11 @@ void process_chunk(const char* data, size_t start, size_t end, ThreadData& state
       coeff = 1;
       last = i+1;
       sz = 0;
+      h.val = 0;
     } else if (c == ';') {
       name_mode = false;
     } else if (name_mode) {
+      h += c;
       sz++;
     } else {
       if (c == '-') {
@@ -244,3 +266,4 @@ int main(int argc, char* argv[]) {
 
   return 0;
 }
+// Next improvement - calculate and send in hash while parsing.
