@@ -168,34 +168,36 @@ void process_chunk(const char* data, size_t start, size_t end, ThreadData& state
   while(end >= 0 && data[end] != '\n') end--;
 
   // Now [start, end] is the set of lines we want.
-  int temp = 0, coeff = 1;
-  size_t last = start, sz = 0;
-  hash_t h;
-  bool name_mode = true;
+  size_t last = start;
   for (size_t i = start; i <= end; i++) {
-    const char& c = data[i];
-    if (c == '\n') {
-      state.temp_map.at_with_hash(std::string_view(data + last, sz), h) += coeff*temp;
-
-      // reset
-      name_mode = true;
-      temp =0;
-      coeff = 1;
-      last = i+1;
-      sz = 0;
-      h.val = 0;
-    } else if (c == ';') {
-      name_mode = false;
-    } else if (name_mode) {
-      h += c;
+    hash_t h;
+    int sz = 0;
+    while(data[i] != ';') {
+      h += data[i++];
       sz++;
-    } else {
-      if (c == '-') {
-        coeff = -1;
-      } else if (c != '.') {
-        temp = 10*temp + (c - '0');
-      }
     }
+
+    // Skip the ;
+    i++;
+
+    int coeff = 1, temp = 0;
+    if (data[i] == '-') {
+      coeff = -1;
+      i++;
+    }
+    if (data[i+1] == '.') {
+      temp = (data[i]*10 + data[i+2] - (11*'0'))*coeff;
+      i += 2;
+    } else {
+      temp = (data[i]*100 + data[i+1] * 10 +  data[i+3] - (111*'0'))*coeff;
+      i += 3;
+    }
+
+    state.temp_map.at_with_hash(std::string_view(data + last, sz), h) += coeff*temp;
+
+    // reset
+    i++;
+    last = i+1;
   }
 }
 
@@ -250,7 +252,7 @@ int main(int argc, char* argv[]) {
     d.name = name;
     data.push_back(d);
   }
-  sort(data.begin(), data.end(), [&](const auto& x, const auto& y)->bool {
+  sort(data.begin(), data.end(), [&](const Data& x, const Data& y)->bool {
     return x.name < y.name;
   });
 
