@@ -8,6 +8,9 @@
 #define NUM_THREADS 8
 #endif
 
+#define likely(x)       __builtin_expect(!!(x), 1)
+#define unlikely(x)     __builtin_expect(!!(x), 0)
+
 struct hash_t {
   const static uint32_t BASE = 1e9+123;
   uint32_t val;
@@ -19,7 +22,6 @@ struct hash_t {
     return *this;
   }
 };
-
 
 // Open addressed hash map that uses a fixed array size and linear probing.
 // Assumes that the number of entries is less than SIZE.
@@ -110,13 +112,13 @@ struct FixedHashMap {
     auto key_hash = h.val;
     for (;;key_hash++) {
       size_t idx = array_index(key_hash);
-      if (!hash_array[idx].exists) {
+      if (unlikely(!hash_array[idx].exists)) {
         // key does not exist in the hash map, so create it.
         hash_array[idx].exists = 1;
         hash_array[idx].value.first = key;
         return hash_array[idx].value.second;
       }
-      if (hash_array[idx].value.first == key) {
+      if (likely(hash_array[idx].value.first == key)) {
         // key already exists in the hash map - just return the reference
         return hash_array[idx].value.second;
       }
