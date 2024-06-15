@@ -1,8 +1,8 @@
 #include <bits/stdc++.h>
-#include <bits/extc++.h>
 #include <fcntl.h>
 #include <sys/mman.h>
 #include <sys/stat.h>
+#include <immintrin.h>
 
 #ifndef NUM_THREADS
 #define NUM_THREADS 8
@@ -16,6 +16,7 @@ struct hash_t {
   uint32_t val;
 
   hash_t(): val(0) {}
+  hash_t(uint32_t x):val(x) {}
 
   hash_t& operator+=(char c) {
     val = BASE*val + c;
@@ -26,7 +27,7 @@ struct hash_t {
 // Open addressed hash map that uses a fixed array size and linear probing.
 // Assumes that the number of entries is less than SIZE.
 // Does not support deletion.
-template<typename K, typename V, const int SIZE = 1<<16>
+template<typename K, typename V, const int SIZE = 1<<15>
 struct FixedHashMap {
   // Hash map entry. This appears to be faster than std::optional
   // and emplace().
@@ -161,6 +162,15 @@ struct ThreadData {
   ThreadData() = default;
 };
 
+// It should be possible to make this much better, still a placeholder.
+hash_t inline __attribute__((always_inline)) mm256_hash(const __m256i val) {
+  __m128i l = _mm256_extracti128_si256(val, 0);
+  __m128i h = _mm256_extracti128_si256(val, 1);
+  l = _mm_add_epi32(l, h);
+  l = _mm_hadd_epi32(l, l);
+  return _mm_extract_epi32(l, 0) + _mm_extract_epi32(l, 1);
+}
+
 void process_chunk(const char* data, size_t start, size_t end, ThreadData& state) {
   // Go back until start points to a '\n', or you reach the beginning.
   while(start > 0 && data[start] != '\n') start--;
@@ -171,31 +181,57 @@ void process_chunk(const char* data, size_t start, size_t end, ThreadData& state
 
   // Now [start, end] is the set of lines we want.
   size_t last = start;
+  const __m256i semicolon_mask = _mm256_set1_epi8(';');
+  const __m256i index_mask = _mm256_set_epi8(31, 30, 29, 28, 27, 26, 25, 24, 23, 22, 21, 20, 19, 18, 17, 16, 15, 14, 13, 12, 11, 10, 9, 8, 7, 6, 5, 4, 3, 2, 1, 0);
   for (size_t i = start; i <= end; i++) {
     hash_t h;
     int sz = 0;
-    while(data[i] != ';') {
-      h += data[i++];
-      sz++;
+    // Process the station name first.
+    if (unlikely(i + 32) > end) {
+      // Intrinsics may access out of memory here. Do things naively.
+      while(data[i] != ';') {
+        h += data[i++];
+        sz++;
+      }
+    } else {
+      // Use intrinsics to find the semicolon fast.
+      auto window = _mm256_loadu_si256(reinterpret_cast<const __m256i*>(data+i));
+      __m256i semicolons = _mm256_cmpeq_epi8(window, semicolon_mask);
+      int mask = _mm256_movemask_epi8(semicolons);
+      if (likely(mask)) {
+        int pos = __builtin_ctz(mask); // semicolon position found
+        __m256i pos_mask = _mm256_set1_epi8(pos);
+        __m256i prefix_mask = _mm256_cmpgt_epi8(pos_mask, index_mask);
+        __m256i prefix_window = _mm256_and_si256(window, prefix_mask);
+
+        // Hash the 256 bit string.
+        h = mm256_hash(prefix_window);
+        i += pos;
+        sz = pos;
+      } else {
+        // Semicolon is not one of the first 32 bytes.
+        // For now, say this is unlikely and just do it naively.
+        while(data[i] != ';') {
+          h += data[i++];
+          sz++;
+        }
+      }
     }
 
     // Skip the ;
     i++;
 
-    int coeff = 1, temp = 0;
-    if (data[i] == '-') {
-      coeff = -1;
-      i++;
-    }
-    if (data[i+1] == '.') {
-      temp = (data[i]*10 + data[i+2] - (11*'0'))*coeff;
-      i += 2;
-    } else {
-      temp = (data[i]*100 + data[i+1] * 10 +  data[i+3] - (111*'0'))*coeff;
-      i += 3;
-    }
-
-    state.temp_map.at_with_hash(std::string_view(data + last, sz), h) += coeff*temp;
+    // Use SWAR magic to parse the integer.
+    int64_t word;
+    memcpy(&word, data+i, sizeof(int64_t));
+    int decimalSepPos = __builtin_ctzll(~word & 0x10101000);
+    int shift = 28 - decimalSepPos;
+    int64_t sgnd = (~word << 59) >> 63;
+    int64_t designMask = ~(sgnd & 0xFF);
+    int64_t digits = ((word & designMask) << shift) & 0x0F000F0F00L;
+    int64_t absValue = ((digits * 0x640a0001) >> 32) & 0x3FF;
+    i += (decimalSepPos>>3) + 2;
+    state.temp_map.at_with_hash(std::string_view(data + last, sz), h) += (absValue^sgnd) - sgnd;
 
     // reset
     i++;
@@ -243,9 +279,19 @@ int main(int argc, char* argv[]) {
   for (auto& t : threads) t.join();
 
   // Merge all data into states[0]
+  const __m256i index_mask = _mm256_set_epi8(31, 30, 29, 28, 27, 26, 25, 24, 23, 22, 21, 20, 19, 18, 17, 16, 15, 14, 13, 12, 11, 10, 9, 8, 7, 6, 5, 4, 3, 2, 1, 0);
   for (int j = 1; j < NUM_THREADS; j++) {
     for (auto& [k, v] : states[j].temp_map) {
-      states[0].temp_map[k] += v;
+      if (likely(k.size()) <= 32) {
+        auto window = _mm256_loadu_si256(reinterpret_cast<const __m256i*>(k.data()));
+        __m256i pos_mask = _mm256_set1_epi8(k.size());
+        __m256i prefix_mask = _mm256_cmpgt_epi8(pos_mask, index_mask);
+        __m256i prefix_window = _mm256_and_si256(window, prefix_mask);
+        hash_t h = mm256_hash(prefix_window);
+        states[0].temp_map.at_with_hash(k, h) += v;
+      } else {
+        states[0].temp_map[k] += v;
+      }
     }
   }
 
@@ -270,4 +316,3 @@ int main(int argc, char* argv[]) {
 
   return 0;
 }
-// Next improvement - calculate and send in hash while parsing.
