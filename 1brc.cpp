@@ -181,8 +181,6 @@ void process_chunk(const char* data, size_t start, size_t end, ThreadData& state
 
   // Now [start, end] is the set of lines we want.
   size_t last = start;
-  const __m256i semicolon_mask = _mm256_set1_epi8(';');
-  const __m256i index_mask = _mm256_set_epi8(31, 30, 29, 28, 27, 26, 25, 24, 23, 22, 21, 20, 19, 18, 17, 16, 15, 14, 13, 12, 11, 10, 9, 8, 7, 6, 5, 4, 3, 2, 1, 0);
   for (size_t i = start; i <= end; i++) {
     hash_t h;
     int sz = 0;
@@ -194,26 +192,52 @@ void process_chunk(const char* data, size_t start, size_t end, ThreadData& state
         sz++;
       }
     } else {
+      const __m256i semicolon_mask = _mm256_set1_epi8(';');
+      const __m256i index_mask = _mm256_set_epi8(31, 30, 29, 28, 27, 26, 25, 24, 23, 22, 21, 20, 19, 18, 17, 16, 15, 14, 13, 12, 11, 10, 9, 8, 7, 6, 5, 4, 3, 2, 1, 0);
+
       // Use intrinsics to find the semicolon fast.
-      auto window = _mm256_loadu_si256(reinterpret_cast<const __m256i*>(data+i));
-      __m256i semicolons = _mm256_cmpeq_epi8(window, semicolon_mask);
-      int mask = _mm256_movemask_epi8(semicolons);
-      if (likely(mask)) {
-        int pos = __builtin_ctz(mask); // semicolon position found
+      // We can do two at a time since instruction throughput is 0.5.
+      auto window1 = _mm256_lddqu_si256(reinterpret_cast<const __m256i*>(data+i));
+      auto window2 = _mm256_lddqu_si256(reinterpret_cast<const __m256i*>(data+i+32));
+      auto semicolons1 = _mm256_cmpeq_epi8(window1, semicolon_mask);
+      auto semicolons2 = _mm256_cmpeq_epi8(window2, semicolon_mask);
+      int mask1 = _mm256_movemask_epi8(semicolons1);
+      int mask2 = _mm256_movemask_epi8(semicolons2);
+      if (likely(mask1)) {
+        int pos = __builtin_ctz(mask1); // semicolon position found
         __m256i pos_mask = _mm256_set1_epi8(pos);
         __m256i prefix_mask = _mm256_cmpgt_epi8(pos_mask, index_mask);
-        __m256i prefix_window = _mm256_and_si256(window, prefix_mask);
+        __m256i prefix_window = _mm256_and_si256(window1, prefix_mask);
 
         // Hash the 256 bit string.
         h = mm256_hash(prefix_window);
         i += pos;
         sz = pos;
+      } else if (mask2){
+        // Just use the first 256 bits for the hash.
+        h = mm256_hash(window1);
+        int pos = __builtin_ctz(mask1); // semicolon position found
+        i += pos+32;
+        sz = pos+32;
       } else {
-        // Semicolon is not one of the first 32 bytes.
-        // For now, say this is unlikely and just do it naively.
-        while(data[i] != ';') {
-          h += data[i++];
-          sz++;
+        // Just use the first 256 bits for the hash.
+        h = mm256_hash(window1);
+
+        // We can do two at a time since throughput is 0.5.
+        auto window1 = _mm256_lddqu_si256(reinterpret_cast<const __m256i*>(data+i+64));
+        auto window2 = _mm256_lddqu_si256(reinterpret_cast<const __m256i*>(data+i+98));
+        auto semicolons1 = _mm256_cmpeq_epi8(window1, semicolon_mask);
+        auto semicolons2 = _mm256_cmpeq_epi8(window2, semicolon_mask);
+        int mask1 = _mm256_movemask_epi8(semicolons1);
+        int mask2 = _mm256_movemask_epi8(semicolons2);
+        if (likely(mask1)) {
+          int pos = __builtin_ctz(mask1);
+          i += 32+pos;
+          sz = 32+pos;
+        } else {
+          int pos = __builtin_ctz(mask2);
+          i += 64+pos;
+          sz = 64+pos;
         }
       }
     }
@@ -283,14 +307,16 @@ int main(int argc, char* argv[]) {
   for (int j = 1; j < NUM_THREADS; j++) {
     for (auto& [k, v] : states[j].temp_map) {
       if (likely(k.size()) <= 32) {
-        auto window = _mm256_loadu_si256(reinterpret_cast<const __m256i*>(k.data()));
+        auto window = _mm256_lddqu_si256(reinterpret_cast<const __m256i*>(k.data()));
         __m256i pos_mask = _mm256_set1_epi8(k.size());
         __m256i prefix_mask = _mm256_cmpgt_epi8(pos_mask, index_mask);
         __m256i prefix_window = _mm256_and_si256(window, prefix_mask);
         hash_t h = mm256_hash(prefix_window);
         states[0].temp_map.at_with_hash(k, h) += v;
       } else {
-        states[0].temp_map[k] += v;
+        auto window = _mm256_lddqu_si256(reinterpret_cast<const __m256i*>(k.data()));
+        hash_t h = mm256_hash(window);
+        states[0].temp_map.at_with_hash(k, h) += v;
       }
     }
   }
