@@ -17,7 +17,7 @@ endif
 
 .PHONY: profile
 profile: 1brc
-	perf record --call-graph dwarf,4096 ./1brc measurements_100m.txt
+	perf record --call-graph dwarf,4096 ./1brc measurements.txt
 
 .PHONY: clean
 clean:
@@ -25,4 +25,4 @@ clean:
 
 .PHONY: measure
 measure: 1brc
-	hyperfine --warmup 1 --runs 5 './1brc measurements_100m.txt'
+	hyperfine --warmup 1 --runs 5 './1brc measurements.txt'
