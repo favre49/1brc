@@ -1,4 +1,5 @@
 #include <bits/stdc++.h>
+#include <bits/extc++.h>
 #include <fcntl.h>
 #include <sys/mman.h>
 #include <sys/stat.h>
@@ -11,34 +12,99 @@
 #define likely(x)       __builtin_expect(!!(x), 1)
 #define unlikely(x)     __builtin_expect(!!(x), 0)
 
-struct hash_t {
-  const static uint32_t BASE = 1e9+123;
-  uint32_t val;
+using hash_t = uint32_t;
 
-  hash_t(): val(0) {}
-  hash_t(uint32_t x):val(x) {}
+// StationName is a specialized string for storing station names.
+// It enforces cache line byte alignment to optimize loads.
+struct StationName {
+  alignas(32) char s[32];
+  size_t len;
+  const char* ptr;
 
-  hash_t& operator+=(char c) {
-    val = BASE*val + c;
+  StationName() = default;
+
+  StationName(const char* data, size_t length): len(length) {
+    if (likely(len <= 32)) {
+      std::memset(s, 0, 32);
+      std::memcpy(s, data, len);
+    } else {
+      ptr = data;
+    }
+  }
+
+  // This won't be part of the hot loop, so optimizing it too much
+  // isn't important.
+  bool operator<(const StationName& o) const {
+    const char *this_ptr = nullptr, *other_ptr = nullptr;
+    int this_len = size(), other_len = o.size();
+    if (likely(this_len <= 32)) this_ptr = s; 
+    else this_ptr = ptr;
+    if (likely(other_len <= 32)) other_ptr = o.s; 
+    else other_ptr = o.ptr;
+    // Compare the two strings
+    int min_len = std::min(this_len, other_len);
+    int res = std::memcmp(this_ptr, other_ptr, min_len);
+    if (res < 0) return true;
+    else if (res == 0) return this_len < other_len;
+    return false;
+  }
+
+  friend std::ostream &operator<<(std::ostream &os, const StationName& s) {
+    if (likely(s.len <= 32)) {
+      return os << s.s;
+    } 
+    for (int i =0; i < s.len; i++) os << s.ptr[i];
+    return os;
+  }
+
+  size_t size() const {
+    return len;
+  }
+};
+
+struct Data {
+  StationName name;
+  int count = 0;
+  int64_t sum = 0;
+  int min = std::numeric_limits<int>::max();
+  int max = std::numeric_limits<int>::min();
+
+  Data() = default;
+
+  Data& operator+=(const Data& other) {
+    count += other.count;
+    sum += other.sum;
+    min = std::min(other.min, min);
+    max = std::max(other.max, max);
+    return *this;
+  } 
+
+  Data& operator+=(int temp) {
+    count++;
+    sum += temp;
+    min = std::min(min, temp);
+    max = std::max(max, temp);
     return *this;
   }
 };
 
+
 // Open addressed hash map that uses a fixed array size and linear probing.
 // Assumes that the number of entries is less than SIZE.
 // Does not support deletion.
-template<typename K, typename V, const int SIZE = 1<<15>
+// K must be default constructible.
+template<const int SIZE = 1<<15>
 struct FixedHashMap {
   // Hash map entry. This appears to be faster than std::optional
   // and emplace().
   struct Entry {
     bool exists;
-    std::pair<K, V> value;
+    std::pair<StationName, Data> value;
   };
 
   // Forward iterator for FixedHashMap.
   struct iterator {
-    using value_type = std::pair<K, V>;
+    using value_type = std::pair<StationName, Data>;
     using difference_type = ptrdiff_t;
     using pointer = value_type*;
     using reference = value_type&;
@@ -101,63 +167,48 @@ struct FixedHashMap {
     return iterator(hash_array, SIZE);
   }
 
-  template<typename T>
-  V& operator[](T&& key) {
-    hash_t h;
-    for (auto& c : key) h += c;
-    return at_with_hash(std::forward<T>(key), h);
-  }
-
-  template<typename T>
-  V& at_with_hash(T&& key, hash_t h) {
-    auto key_hash = h.val;
+  Data& probe_with_short_string(const char* data, int len, const __m256i vec, hash_t h) {
+    auto key_hash = h;
     for (;;key_hash++) {
       size_t idx = array_index(key_hash);
       if (unlikely(!hash_array[idx].exists)) {
-        // key does not exist in the hash map, so create it.
         hash_array[idx].exists = 1;
-        hash_array[idx].value.first = key;
+        hash_array[idx].value.first = StationName(data, len);
         return hash_array[idx].value.second;
       }
-      if (likely(hash_array[idx].value.first == key)) {
-        // key already exists in the hash map - just return the reference
-        return hash_array[idx].value.second;
+      if (likely(hash_array[idx].value.first.size() <= 32)) {
+        // This has to be true since the string is short.
+        auto window = _mm256_load_si256(reinterpret_cast<const __m256i*>(hash_array[idx].value.first.s));
+        auto neq = _mm256_xor_si256(window, vec);
+        if (likely(_mm256_testz_si256(neq, neq))) {
+          // The two strings are equal
+          return hash_array[idx].value.second;
+        }
       }
     }
-    // UB. This should never happen, since we assume the number of elements is
-    // less than SIZE.
-    assert(false);
+  }
+
+  Data& probe_with_long_string(const char* data, int len, hash_t h) {
+    auto key_hash = h;
+    for (;; key_hash++) {
+      size_t idx = array_index(key_hash);
+      if (unlikely(!hash_array[idx].exists)) {
+        hash_array[idx].exists = 1;
+        hash_array[idx].value.first = StationName(data, len);
+        return hash_array[idx].value.second;
+      }
+      if (unlikely(hash_array[idx].value.first.size() > 32)) {
+        // This has to be true since the string is long.
+        if (unlikely(hash_array[idx].value.first.size() != len)) continue;
+        if (likely(std::memcmp(hash_array[idx].value.first.ptr, data, len) == 0)) return hash_array[idx].value.second;
+      }
+    }
   }
 };
 
-struct Data {
-  std::string_view name;
-  int count = 0;
-  int64_t sum = 0;
-  int min = std::numeric_limits<int>::max();
-  int max = std::numeric_limits<int>::min();
-
-  Data() = default;
-
-  Data& operator+=(const Data& other) {
-    count += other.count;
-    sum += other.sum;
-    min = std::min(other.min, min);
-    max = std::max(other.max, max);
-    return *this;
-  } 
-
-  Data& operator+=(int temp) {
-    count++;
-    sum += temp;
-    min = std::min(min, temp);
-    max = std::max(max, temp);
-    return *this;
-  }
-};
 
 struct ThreadData {
-  FixedHashMap<std::string_view, Data> temp_map;
+  FixedHashMap<> temp_map;
 
   ThreadData() = default;
 };
@@ -171,6 +222,103 @@ hash_t inline __attribute__((always_inline)) mm256_hash(const __m256i val) {
   return _mm_extract_epi32(l, 0) + _mm_extract_epi32(l, 1);
 }
 
+size_t inline __attribute__((always_inline)) swar_parse_temperature(const char* data, int& temp) {
+  int64_t word;
+  memcpy(&word, data, sizeof(int64_t));
+  int decimalSepPos = __builtin_ctzll(~word & 0x10101000);
+  int shift = 28 - decimalSepPos;
+  int64_t sgnd = (~word << 59) >> 63;
+  int64_t designMask = ~(sgnd & 0xFF);
+  int64_t digits = ((word & designMask) << shift) & 0x0F000F0F00L;
+  int64_t absValue = ((digits * 0x640a0001) >> 32) & 0x3FF;
+  temp = (absValue^sgnd) - sgnd;
+  return (decimalSepPos>>3) + 2;
+}
+
+void inline __attribute__((always_inline)) simd_process(const char* data, const size_t start, const size_t end, ThreadData& state) {
+  size_t last = start;
+  const __m256i semicolon_mask = _mm256_set1_epi8(';');
+  const __m256i index_mask = _mm256_set_epi8(31, 30, 29, 28, 27, 26, 25, 24, 23, 22, 21, 20, 19, 18, 17, 16, 15, 14, 13, 12, 11, 10, 9, 8, 7, 6, 5, 4, 3, 2, 1, 0);
+  for (size_t i = start; i <= end; i++) {
+    int sz = 0;
+    hash_t h;
+
+    // Use intrinsics to find the semicolon fast.
+    // We can do two at a time since instruction throughput is 0.5.
+    // Somehow lddqu gives a speedup here over loadu, but consensus online is
+    // that there isn't a difference. So why?
+    auto window1 = _mm256_lddqu_si256(reinterpret_cast<const __m256i*>(data+i));
+    auto window2 = _mm256_lddqu_si256(reinterpret_cast<const __m256i*>(data+i+32));
+    auto semicolons1 = _mm256_cmpeq_epi8(window1, semicolon_mask);
+    auto semicolons2 = _mm256_cmpeq_epi8(window2, semicolon_mask);
+    int mask1 = _mm256_movemask_epi8(semicolons1);
+    int mask2 = _mm256_movemask_epi8(semicolons2);
+    // The most likely scnerio 
+    if (likely(mask1)) {
+      int pos = __builtin_ctz(mask1); // semicolon position found
+      __m256i pos_mask = _mm256_set1_epi8(pos);
+      __m256i prefix_mask = _mm256_cmpgt_epi8(pos_mask, index_mask);
+      __m256i prefix_window = _mm256_and_si256(window1, prefix_mask);
+
+      // Hash the 256 bit string.
+      h = mm256_hash(prefix_window);
+      i += pos;
+      sz = pos;
+
+      // Skip the ;
+      i++;
+
+      int temp;
+      size_t offset = swar_parse_temperature(data+i, temp);
+      i += offset;
+      state.temp_map.probe_with_short_string(data+last, sz, prefix_window, h) += temp;;
+    } else if (mask2){
+      // Just use the first 256 bits for the hash.
+      h = mm256_hash(window1);
+      int pos = __builtin_ctz(mask1); // semicolon position found
+      i += pos+32;
+      sz = pos+32;
+
+      // Skip the ;
+      i++;
+      int temp;
+      size_t offset = swar_parse_temperature(data+i, temp);
+      i += offset;
+      state.temp_map.probe_with_long_string(data+last, sz, h) += temp;
+    } else {
+      // Just use the first 256 bits for the hash.
+      h = mm256_hash(window1);
+
+      // We can do two at a time since throughput is 0.5.
+      auto window1 = _mm256_lddqu_si256(reinterpret_cast<const __m256i*>(data+i+64));
+      auto window2 = _mm256_lddqu_si256(reinterpret_cast<const __m256i*>(data+i+98));
+      auto semicolons1 = _mm256_cmpeq_epi8(window1, semicolon_mask);
+      auto semicolons2 = _mm256_cmpeq_epi8(window2, semicolon_mask);
+      int mask1 = _mm256_movemask_epi8(semicolons1);
+      int mask2 = _mm256_movemask_epi8(semicolons2);
+      if (likely(mask1)) {
+        int pos = __builtin_ctz(mask1);
+        i += 32+pos;
+        sz = 32+pos;
+      } else {
+        int pos = __builtin_ctz(mask2);
+        i += 64+pos;
+        sz = 64+pos;
+      }
+
+      // Skip the ;
+      i++;
+      int temp;
+      size_t offset = swar_parse_temperature(data+i, temp);
+      i += offset;
+      state.temp_map.probe_with_long_string(data+last, sz, h) += temp;
+    }
+
+    // reset
+    last = i+1;
+  }
+}
+
 void process_chunk(const char* data, size_t start, size_t end, ThreadData& state) {
   // Go back until start points to a '\n', or you reach the beginning.
   while(start > 0 && data[start] != '\n') start--;
@@ -179,88 +327,8 @@ void process_chunk(const char* data, size_t start, size_t end, ThreadData& state
   // Go back until end points to a '\n'.
   while(end >= 0 && data[end] != '\n') end--;
 
-  // Now [start, end] is the set of lines we want.
-  size_t last = start;
-  for (size_t i = start; i <= end; i++) {
-    hash_t h;
-    int sz = 0;
-    // Process the station name first.
-    if (unlikely(i + 32) > end) {
-      // Intrinsics may access out of memory here. Do things naively.
-      while(data[i] != ';') {
-        h += data[i++];
-        sz++;
-      }
-    } else {
-      const __m256i semicolon_mask = _mm256_set1_epi8(';');
-      const __m256i index_mask = _mm256_set_epi8(31, 30, 29, 28, 27, 26, 25, 24, 23, 22, 21, 20, 19, 18, 17, 16, 15, 14, 13, 12, 11, 10, 9, 8, 7, 6, 5, 4, 3, 2, 1, 0);
-
-      // Use intrinsics to find the semicolon fast.
-      // We can do two at a time since instruction throughput is 0.5.
-      auto window1 = _mm256_lddqu_si256(reinterpret_cast<const __m256i*>(data+i));
-      auto window2 = _mm256_lddqu_si256(reinterpret_cast<const __m256i*>(data+i+32));
-      auto semicolons1 = _mm256_cmpeq_epi8(window1, semicolon_mask);
-      auto semicolons2 = _mm256_cmpeq_epi8(window2, semicolon_mask);
-      int mask1 = _mm256_movemask_epi8(semicolons1);
-      int mask2 = _mm256_movemask_epi8(semicolons2);
-      if (likely(mask1)) {
-        int pos = __builtin_ctz(mask1); // semicolon position found
-        __m256i pos_mask = _mm256_set1_epi8(pos);
-        __m256i prefix_mask = _mm256_cmpgt_epi8(pos_mask, index_mask);
-        __m256i prefix_window = _mm256_and_si256(window1, prefix_mask);
-
-        // Hash the 256 bit string.
-        h = mm256_hash(prefix_window);
-        i += pos;
-        sz = pos;
-      } else if (mask2){
-        // Just use the first 256 bits for the hash.
-        h = mm256_hash(window1);
-        int pos = __builtin_ctz(mask1); // semicolon position found
-        i += pos+32;
-        sz = pos+32;
-      } else {
-        // Just use the first 256 bits for the hash.
-        h = mm256_hash(window1);
-
-        // We can do two at a time since throughput is 0.5.
-        auto window1 = _mm256_lddqu_si256(reinterpret_cast<const __m256i*>(data+i+64));
-        auto window2 = _mm256_lddqu_si256(reinterpret_cast<const __m256i*>(data+i+98));
-        auto semicolons1 = _mm256_cmpeq_epi8(window1, semicolon_mask);
-        auto semicolons2 = _mm256_cmpeq_epi8(window2, semicolon_mask);
-        int mask1 = _mm256_movemask_epi8(semicolons1);
-        int mask2 = _mm256_movemask_epi8(semicolons2);
-        if (likely(mask1)) {
-          int pos = __builtin_ctz(mask1);
-          i += 32+pos;
-          sz = 32+pos;
-        } else {
-          int pos = __builtin_ctz(mask2);
-          i += 64+pos;
-          sz = 64+pos;
-        }
-      }
-    }
-
-    // Skip the ;
-    i++;
-
-    // Use SWAR magic to parse the integer.
-    int64_t word;
-    memcpy(&word, data+i, sizeof(int64_t));
-    int decimalSepPos = __builtin_ctzll(~word & 0x10101000);
-    int shift = 28 - decimalSepPos;
-    int64_t sgnd = (~word << 59) >> 63;
-    int64_t designMask = ~(sgnd & 0xFF);
-    int64_t digits = ((word & designMask) << shift) & 0x0F000F0F00L;
-    int64_t absValue = ((digits * 0x640a0001) >> 32) & 0x3FF;
-    i += (decimalSepPos>>3) + 2;
-    state.temp_map.at_with_hash(std::string_view(data + last, sz), h) += (absValue^sgnd) - sgnd;
-
-    // reset
-    i++;
-    last = i+1;
-  }
+  const size_t THREAD_BLOCKS = 2;
+  simd_process(data, start, end, state);
 }
 
 int main(int argc, char* argv[]) {
@@ -306,17 +374,17 @@ int main(int argc, char* argv[]) {
   const __m256i index_mask = _mm256_set_epi8(31, 30, 29, 28, 27, 26, 25, 24, 23, 22, 21, 20, 19, 18, 17, 16, 15, 14, 13, 12, 11, 10, 9, 8, 7, 6, 5, 4, 3, 2, 1, 0);
   for (int j = 1; j < NUM_THREADS; j++) {
     for (auto& [k, v] : states[j].temp_map) {
-      if (likely(k.size()) <= 32) {
-        auto window = _mm256_lddqu_si256(reinterpret_cast<const __m256i*>(k.data()));
+      if (likely(k.size() <= 32)) {
+        auto window = _mm256_loadu_si256(reinterpret_cast<const __m256i*>(k.s));
         __m256i pos_mask = _mm256_set1_epi8(k.size());
         __m256i prefix_mask = _mm256_cmpgt_epi8(pos_mask, index_mask);
         __m256i prefix_window = _mm256_and_si256(window, prefix_mask);
         hash_t h = mm256_hash(prefix_window);
-        states[0].temp_map.at_with_hash(k, h) += v;
+        states[0].temp_map.probe_with_short_string(k.s, k.len, prefix_window, h) += v;
       } else {
-        auto window = _mm256_lddqu_si256(reinterpret_cast<const __m256i*>(k.data()));
+        auto window = _mm256_lddqu_si256(reinterpret_cast<const __m256i*>(k.ptr));
         hash_t h = mm256_hash(window);
-        states[0].temp_map.at_with_hash(k, h) += v;
+        states[0].temp_map.probe_with_long_string(k.ptr, k.len, h) += v;
       }
     }
   }
