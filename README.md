@@ -7,7 +7,7 @@ A C++ solution to the [1 Billion Row Challenge](https://1brc.dev/) using AVX SIM
 make measure
 ```
 
-The current mean runtime on my machine is ~300 ms on a 100 million row test set.
+The current mean runtime on my machine is ~300 ms on a 100 million row test set running with 8 threads on an Intel i5-8300H.
 
 ## Caveats
 
