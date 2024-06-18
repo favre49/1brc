@@ -18,8 +18,8 @@ using hash_t = uint32_t;
 // It enforces cache line byte alignment to optimize loads.
 struct StationName {
   alignas(32) char s[32];
-  size_t len;
   const char* ptr;
+  size_t len;
 
   StationName() = default;
 
@@ -63,7 +63,6 @@ struct StationName {
 };
 
 struct Data {
-  StationName name;
   int count = 0;
   int64_t sum = 0;
   int min = std::numeric_limits<int>::max();
@@ -97,10 +96,7 @@ template<const int SIZE = 1<<15>
 struct FixedHashMap {
   // Hash map entry. This appears to be faster than std::optional
   // and emplace().
-  struct Entry {
-    bool exists;
-    std::pair<StationName, Data> value;
-  };
+  using Entry = std::pair<StationName, Data>;
 
   // Forward iterator for FixedHashMap.
   struct iterator {
@@ -110,26 +106,26 @@ struct FixedHashMap {
     using reference = value_type&;
     using iterator_category = std::forward_iterator_tag;
 
-    std::array<Entry, SIZE> &data;
+    std::array<value_type, SIZE> &data;
     size_t idx;
 
-    iterator(std::array<Entry, SIZE>& __data, size_t __idx = 0)
+    iterator(std::array<value_type, SIZE>& __data, size_t __idx = 0)
       : data(__data), idx(__idx) {
-        while(idx < SIZE && !data[idx].exists) idx++;
+        while(idx < SIZE && !data[idx].second.count) idx++;
       }
 
     reference operator*() const {
-      return data[idx].value;
+      return data[idx];
     }
 
     pointer operator->() const {
-      return &(data[idx].value);
+      return &(data[idx]);
     }
 
     iterator& operator++() {
       do {
         idx++;
-      } while(idx < SIZE && !data[idx].exists);
+      } while(idx < SIZE && !data[idx].second.count);
       return *this;
     }
 
@@ -171,18 +167,17 @@ struct FixedHashMap {
     auto key_hash = h;
     for (;;key_hash++) {
       size_t idx = array_index(key_hash);
-      if (unlikely(!hash_array[idx].exists)) {
-        hash_array[idx].exists = 1;
-        hash_array[idx].value.first = StationName(data, len);
-        return hash_array[idx].value.second;
+      if (unlikely(!hash_array[idx].second.count)) {
+        hash_array[idx].first = StationName(data, len);
+        return hash_array[idx].second;
       }
-      if (likely(hash_array[idx].value.first.size() <= 32)) {
+      if (likely(hash_array[idx].first.size() <= 32)) {
         // This has to be true since the string is short.
-        auto window = _mm256_load_si256(reinterpret_cast<const __m256i*>(hash_array[idx].value.first.s));
+        auto window = _mm256_load_si256(reinterpret_cast<const __m256i*>(hash_array[idx].first.s));
         auto neq = _mm256_xor_si256(window, vec);
         if (likely(_mm256_testz_si256(neq, neq))) {
           // The two strings are equal
-          return hash_array[idx].value.second;
+          return hash_array[idx].second;
         }
       }
     }
@@ -192,15 +187,14 @@ struct FixedHashMap {
     auto key_hash = h;
     for (;; key_hash++) {
       size_t idx = array_index(key_hash);
-      if (unlikely(!hash_array[idx].exists)) {
-        hash_array[idx].exists = 1;
-        hash_array[idx].value.first = StationName(data, len);
-        return hash_array[idx].value.second;
+      if (unlikely(!hash_array[idx].second.count)) {
+        hash_array[idx].first = StationName(data, len);
+        return hash_array[idx].second;
       }
-      if (unlikely(hash_array[idx].value.first.size() > 32)) {
+      if (unlikely(hash_array[idx].first.size() > 32)) {
         // This has to be true since the string is long.
-        if (unlikely(hash_array[idx].value.first.size() != len)) continue;
-        if (likely(std::memcmp(hash_array[idx].value.first.ptr, data, len) == 0)) return hash_array[idx].value.second;
+        if (unlikely(hash_array[idx].first.size() != len)) continue;
+        if (likely(std::memcmp(hash_array[idx].first.ptr, data, len) == 0)) return hash_array[idx].second;
       }
     }
   }
@@ -389,12 +383,16 @@ int main(int argc, char* argv[]) {
     }
   }
 
-  std::vector<Data> data;
+  struct Result {
+    StationName name;
+    Data data;
+  };
+
+  std::vector<Result> data;
   for (auto& [name, d] : states[0].temp_map) {
-    d.name = name;
-    data.push_back(d);
+    data.push_back(Result{std::move(name), std::move(d)});
   }
-  sort(data.begin(), data.end(), [&](const Data& x, const Data& y)->bool {
+  sort(data.begin(), data.end(), [&](const Result& x, const Result& y)->bool {
     return x.name < y.name;
   });
 
@@ -402,7 +400,7 @@ int main(int argc, char* argv[]) {
   std::cout << "{";
   for (int i = 0; i < data.size(); i++) {
     std::cout << data[i].name << "=";
-    std::cout << data[i].min/10.0 << "/" << data[i].sum/double(10*data[i].count) <<  "/" << data[i].max/10.0;
+    std::cout << data[i].data.min/10.0 << "/" << data[i].data.sum/double(10*data[i].data.count) <<  "/" << data[i].data.max/10.0;
     if (i+1 != data.size()) std::cout << ", ";
   }
   std::cout << "}";
