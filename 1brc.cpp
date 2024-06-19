@@ -321,7 +321,6 @@ void process_chunk(const char* data, size_t start, size_t end, ThreadData& state
   // Go back until end points to a '\n'.
   while(end >= 0 && data[end] != '\n') end--;
 
-  const size_t THREAD_BLOCKS = 2;
   simd_process(data, start, end, state);
 }
 
