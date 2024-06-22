@@ -2,7 +2,7 @@
 
 ## What Is It?
 
-A C++ solution to the [1 Billion Row Challenge](https://1brc.dev/) using AVX SIMD intrinsics. Run this by creating an input file named `measurements.txt` and running:
+A C++ solution to the [1 Billion Row Challenge](https://1brc.dev/) using AVX2 SIMD intrinsics. Run this by creating an input file named `measurements.txt` and running:
 ```
 make measure
 ```
